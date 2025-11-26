@@ -6,6 +6,7 @@
   fetchurl,
   appimageTools,
   undmg,
+  makeDesktopItem,
 }:
 
 let
@@ -28,6 +29,17 @@ let
     ];
     mainProgram = "jetbrains-toolbox";
   };
+
+  desktopItem = makeDesktopItem {
+    name = "jetbrains-toolbox";
+    desktopName = "JetBrains Toolbox";
+    exec = "jetbrains-toolbox %u";
+    icon = "jetbrains-toolbox";
+    categories = [ "Development" ];
+    mimeTypes = [ "x-scheme-handler/jetbrains" ];
+    terminal = false;
+  };
+
 
   selectSystem =
     let
@@ -80,7 +92,7 @@ selectKernel {
     buildFHSEnv {
       inherit pname version meta;
       passthru = {
-        inherit src updateScript;
+        inherit src updateScript desktopItem;
       };
       multiPkgs =
         pkgs:
@@ -94,7 +106,7 @@ selectKernel {
       runScript = "${src}/bin/jetbrains-toolbox --update-failed";
 
       extraInstallCommands = ''
-        install -Dm0644 ${src}/bin/jetbrains-toolbox.desktop -t $out/share/applications
+        install -Dm0644 ${desktopItem}/share/applications/jetbrains-toolbox.desktop -t $out/share/applications
         install -Dm0644 ${src}/bin/toolbox-tray-color.png $out/share/pixmaps/jetbrains-toolbox.png
       '';
     };
