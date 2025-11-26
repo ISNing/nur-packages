@@ -14,6 +14,11 @@
   modules = import ./modules; # NixOS modules
   overlays = import ./overlays; # nixpkgs overlays
 
+  # JetBrains Toolbox added with libsecret dependency for Linux
+  # Upstream source: https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/je/jetbrains-toolbox/package.nix
+  # Currently at 00e2c2c3587ab8a46be285ddf7e2e62e22155eed
+  jetbrains-toolbox = pkgs.callPackage ./pkgs/jetbrains-toolbox { };
+
   # some-qt5-package = pkgs.libsForQt5.callPackage ./pkgs/some-qt5-package { };
   # ...
 }
