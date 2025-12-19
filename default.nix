@@ -6,7 +6,7 @@
 # commands such as:
 #     nix-build -A mypackage
 
-{ pkgs ? import <nixpkgs> { } }:
+{ system ? builtins.currentSystem, pkgs ? import <nixpkgs> { inherit system; }, ... }:
 
 {
   # The `lib`, `modules`, and `overlays` names are special
