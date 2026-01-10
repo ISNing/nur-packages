@@ -1,5 +1,5 @@
 {
   # Add your NixOS modules here
   #
-  # my-module = ./my-module;
+  memfd-ashmem-shim = ./memfd-ashmem-shim.nix;
 }
