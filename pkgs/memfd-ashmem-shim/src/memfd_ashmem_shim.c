@@ -1,6 +1,8 @@
 /*
- * memfd_ashmem_shim.c - OOT Kernel Module implementation of AOSP memfd-ashmem-shim
- * FIX: Bypass IBT (Indirect Branch Tracking) crashes on XanMod/Hardened kernels.
+ * memfd_ashmem_shim.c - AOSP Ashmem Shim for memfd (Safe OOT Implementation)
+ * * Strategy:
+ * 1. Use standard 'vm_map_ram' to patch fops (No CR0 hacking, No GPF crash).
+ * 2. Gracefully degrade if memfd_fcntl is IBT-unsafe (No Missing ENDBR crash).
  */
 
 #include <linux/module.h>
@@ -12,15 +14,15 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>
-#include <linux/version.h>
 #include <linux/mman.h>
+#include <linux/vmalloc.h> /* Required for vm_map_ram */
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Isaac J. Manjarres <isaacmanjarres@google.com> (Original)");
-MODULE_DESCRIPTION("Ashmem compatibility for memfd (OOT Module)");
+MODULE_AUTHOR("Isaac J. Manjarres <isaacmanjarres@google.com>");
+MODULE_DESCRIPTION("Ashmem compatibility for memfd");
 
 // ==========================================================================
-// Part 1: Ashmem Definitions
+// Part 1: Ashmem Protocol Definitions
 // ==========================================================================
 
 #define __ASHMEMIOC 0x77
@@ -49,84 +51,61 @@ struct ashmem_pin {
 #define MEMFD_PREFIX "memfd:"
 #define MEMFD_PREFIX_LEN (sizeof(MEMFD_PREFIX) - 1)
 
-long memfd_ashmem_shim_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
-
 // ==========================================================================
-// Part 2: IBT-Safe Symbol Lookup
+// Part 2: Kernel Symbol Resolution (IBT Safe)
 // ==========================================================================
 
 static long (*memfd_fcntl_ptr)(struct file *file, unsigned int cmd, unsigned long arg) = NULL;
 
-/*
- * Direct Kprobe Lookup.
- * Instead of calling kallsyms_lookup_name (which triggers IBT crash),
- * we use the Kprobe registration mechanism itself to resolve the symbol address.
- */
-static unsigned long lookup_symbol_direct(const char *name)
+static unsigned long lookup_symbol_via_kprobe(const char *name)
 {
-    struct kprobe kp = {
-        .symbol_name = name,
-    };
+    struct kprobe kp = { .symbol_name = name };
     unsigned long addr;
     int ret;
 
     ret = register_kprobe(&kp);
-    if (ret < 0) {
-        pr_debug("memfd_ashmem_shim: Failed to find symbol %s via kprobe (err %d)\n", name, ret);
-        return 0;
-    }
+    if (ret < 0) return 0;
     
     addr = (unsigned long)kp.addr;
     unregister_kprobe(&kp);
     return addr;
 }
 
-static int resolve_symbols(void) {
-    unsigned long addr = lookup_symbol_direct("memfd_fcntl");
+static void resolve_deps(void) {
+    unsigned long addr = lookup_symbol_via_kprobe("memfd_fcntl");
     
-    if (!addr) {
-        pr_warn("memfd_ashmem_shim: 'memfd_fcntl' not found. Seal operations will fail.\n");
-        return 0; // Not fatal, just reduced functionality
-    }
-
-    /*
-     * IBT (Indirect Branch Tracking) Safety Check:
-     * If IBT is active, we can only call this function if it starts with ENDBR64.
-     * ENDBR64 opcode is: f3 0f 1e fa
-     */
-#ifdef CONFIG_X86_KERNEL_IBT
-    {
+    if (addr) {
+        // IBT Check: XanMod kernel requires ENDBR64 (0xf3 0f 1e fa) at function entry
+#ifdef CONFIG_X86_64
         u32 *insn = (u32 *)addr;
-        // Check for 0xfa1e0ff3 (Little Endian for f3 0f 1e fa)
+        // 0xfa1e0ff3 is Little Endian for f3 0f 1e fa
         if (insn && *insn != 0xfa1e0ff3) {
-            pr_err("memfd_ashmem_shim: 'memfd_fcntl' found at %lx but missing ENDBR64. Cannot call safely with IBT.\n", addr);
-            return 0;
+            pr_warn("memfd_ashmem_shim: 'memfd_fcntl' missing ENDBR64. Seal ops disabled for safety.\n");
+            memfd_fcntl_ptr = NULL;
+        } else {
+            memfd_fcntl_ptr = (void *)addr;
         }
-    }
+#else
+        memfd_fcntl_ptr = (void *)addr;
 #endif
-
-    memfd_fcntl_ptr = (void *)addr;
-    pr_info("memfd_ashmem_shim: Resolved memfd_fcntl at %p\n", memfd_fcntl_ptr);
-    return 0;
+    } else {
+        pr_warn("memfd_ashmem_shim: 'memfd_fcntl' not found.\n");
+    }
 }
 
-// Wrapper
-static long memfd_fcntl(struct file *file, unsigned int cmd, unsigned long arg) {
-    if (memfd_fcntl_ptr) {
-        return memfd_fcntl_ptr(file, cmd, arg);
-    }
+// ==========================================================================
+// Part 3: AOSP Implementation Logic
+// ==========================================================================
+
+static long shim_memfd_fcntl(struct file *file, unsigned int cmd, unsigned long arg) {
+    if (memfd_fcntl_ptr) return memfd_fcntl_ptr(file, cmd, arg);
     return -ENOSYS; 
 }
-
-// ==========================================================================
-// Part 3: AOSP Implementation
-// ==========================================================================
 
 static const char *get_memfd_name(struct file *file)
 {
     const char *file_name = file->f_path.dentry->d_name.name;
-    if (file_name != strstr(file_name, MEMFD_PREFIX))
-        return NULL;
+    if (file_name != strstr(file_name, MEMFD_PREFIX)) return NULL;
     return file_name;
 }
 
@@ -136,41 +115,35 @@ static long get_name(struct file *file, void __user *name)
     size_t len;
 
     if (!file_name) return -EINVAL;
-
     file_name = &file_name[MEMFD_PREFIX_LEN];
     len = strlen(file_name) + 1;
     if (len > ASHMEM_NAME_LEN) return -EINVAL;
-
     return copy_to_user(name, file_name, len) ? -EFAULT : 0;
 }
 
 static long get_prot_mask(struct file *file)
 {
     long prot_mask = PROT_READ | PROT_EXEC;
-    long seals = memfd_fcntl(file, F_GET_SEALS, 0);
+    long seals = shim_memfd_fcntl(file, F_GET_SEALS, 0);
 
     if (seals < 0) return seals;
-
     if (!(seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)))
         prot_mask |= PROT_WRITE;
-
     return prot_mask;
 }
 
 static long set_prot_mask(struct file *file, unsigned long prot)
 {
     long curr_prot = get_prot_mask(file);
-    long ret = 0;
-
     if (curr_prot < 0) return curr_prot;
 
     prot |= PROT_READ | PROT_EXEC;
     if ((curr_prot & prot) != prot) return -EINVAL;
 
     if (!(prot & PROT_WRITE))
-        ret = memfd_fcntl(file, F_ADD_SEALS, F_SEAL_FUTURE_WRITE);
+        return shim_memfd_fcntl(file, F_ADD_SEALS, F_SEAL_FUTURE_WRITE);
 
-    return ret;
+    return 0;
 }
 
 long memfd_ashmem_shim_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -187,6 +160,7 @@ long memfd_ashmem_shim_ioctl(struct file *file, unsigned int cmd, unsigned long 
         ret = get_name(file, (void __user *)arg);
         break;
     case ASHMEM_GET_SIZE:
+        // Core requirement for Redroid
         ret = i_size_read(file_inode(file));
         break;
     case ASHMEM_SET_PROT_MASK:
@@ -219,7 +193,7 @@ long memfd_ashmem_shim_ioctl(struct file *file, unsigned int cmd, unsigned long 
 }
 
 // ==========================================================================
-// Part 4: Hooks
+// Part 4: The Safe Patching Mechanism (vm_map_ram)
 // ==========================================================================
 
 static struct file_operations *shmem_fops_ptr = NULL;
@@ -233,64 +207,69 @@ static long hooked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return -ENOTTY;
 }
 
-static inline void my_write_cr0(unsigned long cr0) {
-    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
-}
+// Use standard kernel API to map the page as writable, avoiding CR0 pinning issues
+static void patch_pointer(void *target, void *new_val)
+{
+    struct page *page;
+    void *vaddr;
+    unsigned long offset_in_page;
 
-static void enable_write_protection(void) {
-    unsigned long cr0 = read_cr0();
-    my_write_cr0(cr0 | 0x00010000);
-}
+    if (is_vmalloc_addr(target))
+        page = vmalloc_to_page(target);
+    else
+        page = virt_to_page(target);
 
-static void disable_write_protection(void) {
-    unsigned long cr0 = read_cr0();
-    my_write_cr0(cr0 & ~0x00010000);
+    if (!page) {
+        pr_err("memfd_ashmem_shim: Cannot resolve page for %p\n", target);
+        return;
+    }
+
+    // Create a temporary writable alias
+    vaddr = vm_map_ram(&page, 1, -1);
+    if (!vaddr) {
+        pr_err("memfd_ashmem_shim: vm_map_ram failed\n");
+        return;
+    }
+
+    offset_in_page = (unsigned long)target & ~PAGE_MASK;
+    
+    // Perform the write safely
+    memcpy(vaddr + offset_in_page, &new_val, sizeof(void *));
+
+    vm_unmap_ram(vaddr, 1);
 }
 
 static int __init memfd_ashmem_shim_init(void)
 {
     struct file *dummy_file;
 
-    pr_info("memfd_ashmem_shim: Initializing (IBT-Safe Mode)...\n");
+    pr_info("memfd_ashmem_shim: Initializing (Safe Mode)...\n");
 
-    // 1. Resolve symbols (Safe method)
-    resolve_symbols(); 
+    resolve_deps();
 
-    // 2. Locate shmem_file_operations
+    // Find shmem_file_operations via a dummy file
     dummy_file = shmem_kernel_file_setup("memfd_ashmem_shim_probe", 4096, 0);
-    if (IS_ERR(dummy_file)) {
-        pr_err("memfd_ashmem_shim: Failed to create dummy shmem file.\n");
-        return PTR_ERR(dummy_file);
-    }
+    if (IS_ERR(dummy_file)) return PTR_ERR(dummy_file);
 
     shmem_fops_ptr = (struct file_operations *)dummy_file->f_op;
     fput(dummy_file);
 
-    if (!shmem_fops_ptr) {
-        pr_err("memfd_ashmem_shim: f_op was NULL!\n");
-        return -EFAULT;
-    }
+    if (!shmem_fops_ptr) return -EFAULT;
 
+    // Save original
     orig_ioctl = shmem_fops_ptr->unlocked_ioctl;
 
-    preempt_disable();
-    disable_write_protection();
-    shmem_fops_ptr->unlocked_ioctl = hooked_ioctl;
-    enable_write_protection();
-    preempt_enable();
+    // Apply patch safely
+    patch_pointer(&shmem_fops_ptr->unlocked_ioctl, hooked_ioctl);
 
-    pr_info("memfd_ashmem_shim: Hooked successfully.\n");
+    pr_info("memfd_ashmem_shim: Patched shmem_fops->unlocked_ioctl successfully.\n");
     return 0;
 }
 
 static void __exit memfd_ashmem_shim_exit(void)
 {
     if (shmem_fops_ptr) {
-        preempt_disable();
-        disable_write_protection();
-        shmem_fops_ptr->unlocked_ioctl = orig_ioctl;
-        enable_write_protection();
-        preempt_enable();
+        patch_pointer(&shmem_fops_ptr->unlocked_ioctl, orig_ioctl);
         pr_info("memfd_ashmem_shim: Unhooked.\n");
     }
 }
